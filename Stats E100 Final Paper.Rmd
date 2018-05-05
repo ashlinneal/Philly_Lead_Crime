@@ -1,0 +1,201 @@
+---
+title: "Philadelphia Crime and Lead Levels"
+author: "Ashlin Oglesby-Neal"
+date: "May 3, 2018"
+output:
+   html_document:
+    css: www/styles.css
+    code_folding: show
+    toc: TRUE
+    toc_depth: 3
+    toc_float: 
+     collapsed: FALSE
+---
+```{r markdown setup, include=FALSE}
+knitr::opts_chunk$set(message = FALSE)
+knitr::opts_chunk$set(warning = FALSE)
+options(scipen = 999)
+```
+## Prepare Workspace
+### Load packages
+```{r setup, include=TRUE}
+library(tidyverse)
+library(readr)
+library(lubridate)
+library(rgdal)
+library(skimr)
+library(tigris)
+library(tidycensus)
+library(stargazer)
+```
+
+```{r api, include=FALSE}
+census_api_key("196506272f110c24ea0ab882b32211ab91a497ab")
+source('https://raw.githubusercontent.com/UrbanInstitute/urban_R_theme/master/urban_theme_windows.R')
+```
+
+### Load Data
+This project uses two data sets from opendataphilly.org. One is all crime incidents reported by the Philadelphia Police Department and the other is information on children screened for elevated blood lead levels from the Philadelphia Department of Public Health. 
+
+```{r load data, eval=TRUE}
+# crime
+phl <- read_csv("incidents_part1_part2.csv")
+
+# lead levels
+lead <- read_csv("child_blood_lead_levels_by_ct.csv")
+```
+
+## Prepare Data
+### Map Philadelphia Crime
+Almost every crime incident in Philadelphia has a latitude and longitude. The information on lead levels is at the census tract level. Crime incidents are mapped over a shapefile of Philadelphia block groups, so that they can be aggreagated to the census tract level.
+
+```{r map data, results='hide'}
+#add census block group
+bgroup.phl <- block_groups(state = "PA", county="101")
+```
+
+```{r map data2}
+bgroup.phl <- spTransform(bgroup.phl, CRS("+proj=longlat +lat_1=39.93333333333333
+   +lat_2=40.96666666666667 +lat_0=39.33333333333334
+   +lon_0=-77.75 +x_0=600000 +y_0=0 +datum=NAD83
+   +units=us-ft +no_defs +ellps=GRS80 +towgs84=0,0,0"))
+
+# plot all PHL crime
+phl2 <- filter(phl, !is.na(lat) & !is.na(lng))
+plot(bgroup.phl,axes=TRUE)
+points(phl2$lng,phl2$lat,col="blue",pch=20)
+
+b <- SpatialPoints(phl2[,c("lng","lat")],
+                   proj4string=bgroup.phl@proj4string)
+
+# match each polygon in PHL map to each point
+bgroup_lookup2 <- over(b, bgroup.phl)
+bgroup_lookup2[1:3,]
+phl2$bgroup <- bgroup_lookup2$GEOID
+phl2$ctract <- bgroup_lookup2$TRACTCE
+phl2$aland <- bgroup_lookup2$ALAND
+
+phl2 <- phl2 %>%
+  select(-c(the_geom, the_geom_webmercator)) %>%
+  mutate(date = ymd(dispatch_date),
+         year = year(date))
+```
+
+### Aggreagte Crime Data
+After matching each crime incident to a census tract, they can be aggreagated to create a measure of total crime. Crime incidents that did not map to census tracts are excluded.
+
+```{r aggregate to census tract level}
+phl_ct3 <- phl2 %>%
+  filter(!is.na(ctract) & year < 2018) %>%
+  complete(ctract) %>%
+  group_by(ctract) %>%
+  summarize(Crime = n()) 
+phl_ct3[1:5,]
+```
+
+### Clean Lead File
+The lead data set includes information on the number of children screened, the number with elevated blood lead levels, and the percentage with elevated levels per census tract. The number of children with high levels is redacted if it is fewer than six and greater than zero. These redacted values were replaced with five to prevent the loss of these census tracts in analysis, making percentage of kids with high lead levels close to zero rather than missing.
+
+```{r clean lead file}
+lead2 <- lead %>%
+  mutate(num_bll_5plus = ifelse(data_redacted==TRUE & is.na(num_bll_5plus),
+                                5, num_bll_5plus),
+         perc_5plus = ifelse(data_redacted==TRUE & is.na(perc_5plus),
+                             (num_bll_5plus/num_screen), perc_5plus),
+         ctract = str_extract(census_tract, "......$")) 
+lead2[1:3,]
+```
+
+### Merge Crime and Lead Files
+
+```{r merge crime and lead files}
+phl_crime_lead <- phl_ct3 %>%
+  left_join(lead2, by=  "ctract") %>%
+  filter(!is.na(perc_5plus)) %>%
+  rename(Perc_High_Lead = perc_5plus)
+```
+
+### Add ACS Info
+Information on population, poverty, residential stability, and housing age is pulled in from the 2016 5-year ACS using the tidycensus pacakge.
+
+```{r add census info}
+acs <- load_variables(2016, "acs5")
+acs_vars<- c("B01003_001E", "B05010_002E", "B19119_001E", "B07204_002E", "B25035_001E", "B17001_002E")
+
+phl_vars <- get_acs(geography="tract", state="PA", county="Philadelphia", variables=acs_vars)
+phl_acs <- phl_vars %>%
+  select(GEOID, variable, estimate) %>%
+  spread(variable, estimate) %>%
+  rename(Population=B01003_001, Low_Income_Poverty_Ratio=B05010_002,
+         Income=B19119_001, 
+         Same_Residence=B07204_002, House_Built_Yr=B25035_001,
+         Poverty_Rate=B17001_002, census_tract=GEOID) %>%
+  mutate(census_tract = as.numeric(census_tract),
+         Low_Income_Poverty_Ratio = Low_Income_Poverty_Ratio/Population, 
+         Same_Residence = Same_Residence/Population,
+         Poverty_Rate = Poverty_Rate/Population,
+         Pop = Population/1000,
+         Income = Income/10000)
+
+phl_crime_lead <- phl_crime_lead %>%
+  left_join(phl_acs, by="census_tract") %>%
+  mutate(Crime_Rate = (Crime/Population)*1000)
+```
+
+## Analysis
+### Descriptive Statistics
+
+```{r descriptives}
+vars <- phl_crime_lead %>%
+  select(Crime, Crime_Rate, Perc_High_Lead, Population, 
+         Poverty_Rate, Same_Residence, House_Built_Yr) %>%
+  mutate(Poverty_Rate = Poverty_Rate*100, Same_Residence = Same_Residence*100)
+vars <- as.data.frame(vars)
+```
+In html, stargazer descriptive tablescan be squished. Rates have been changed to be between 0-100 rather than 0-1 so that decimals can be removed from all numbers in the table. 
+
+```{r descriptives table, results="asis"}
+stargazer(vars, title="Descriptive Statistics", digits=0, type="html")
+```
+
+### Correlation
+
+```{r analysis}
+cor(phl_crime_lead$Crime, phl_crime_lead$Perc_High_Lead)
+cor(phl_crime_lead$Crime_Rate, phl_crime_lead$Perc_High_Lead)
+```
+
+### Regression
+
+``` {r regression}
+mod1 <- lm(Crime~Perc_High_Lead, data=phl_crime_lead)
+mod2 <- lm(Crime~Perc_High_Lead+Pop+Poverty_Rate+Same_Residence+House_Built_Yr, data=phl_crime_lead)
+mod3 <- lm(Crime_Rate~Perc_High_Lead, data=phl_crime_lead)
+mod4 <- lm(Crime_Rate~Perc_High_Lead+Poverty_Rate+Same_Residence+House_Built_Yr, data=phl_crime_lead)
+```
+
+```{r table1, results="asis"}
+stargazer(mod1, mod2,
+          dep.var.labels = "Crime Count", 
+          title="Crime Regression Results", no.space=TRUE,
+          covariate.labels = c("Percent High Lead", "Population", 
+                               "Poverty Rate", 
+                               "Residential Stability", "House Built Year"),
+          digits=2, omit.stat = c("f", "adj.rsq"), 
+          type="html")
+```
+
+Lead is significant and associated with an increase in crime.
+
+```{r table2, results="asis"}
+stargazer(mod3, mod4,
+          dep.var.labels = "Crime Rate (per 1,000 people)", 
+          title="Crime Rate Regression Results", 
+          no.space=TRUE,
+          covariate.labels = c("Percent High Lead", "Poverty Rate", 
+                               "Residential Stability", "House Built Year"),
+          digits=2, omit.stat = c("f", "adj.rsq"), 
+          type="html")
+```
+
+Lead is significant and associated with an increase in crime rates. 
